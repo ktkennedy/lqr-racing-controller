@@ -146,7 +146,7 @@ Pure input delay of `delay_step = 5` steps (0.20 s) is modeled by augmenting the
 
 $$\mathbf{x}_{\text{full}} = \begin{bmatrix} e_y \\ \dot{e}_y \\ e_\psi \\ \dot{e}_\psi \\ \delta_{\text{actual}} \\ \delta_{k-1} \\ \delta_{k-2} \\ \vdots \\ \delta_{k-n} \end{bmatrix} \in \mathbb{R}^{10}$$
 
-**Extended system** $(n = 5 + \text{delay\_step} = 10)$:
+**Extended system** ( n = 5 + delay_step = 10 ):
 
 $$\mathcal{A}_d = \begin{bmatrix} A_d & B_d & & \\ & & I_{n-1} & \\ & & & 0 \end{bmatrix}_{10\times10}, \quad \mathcal{B}_d = \begin{bmatrix} 0 \\ \vdots \\ 0 \\ 1 \end{bmatrix}_{10\times1}$$
 
