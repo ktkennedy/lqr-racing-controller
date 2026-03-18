@@ -2,6 +2,12 @@
 LQR Preview Controller - Real-time Interactive Simulation
 USAFE Racing Team
 
+Full implementation matching the C++ ROS controller:
+  - Delay-compensated extended state (5 + delay_step)
+  - Preview feedforward (curvature lookahead)
+  - PID speed controller
+  - Speed-scheduled Q/R weights
+
 Run: python3 lqr_realtime.py
 Requirements: numpy, matplotlib, scipy
 
@@ -23,7 +29,10 @@ LF = 1.58
 LR = 1.59
 MASS = 1700.0
 DT = 0.04          # 20 Hz
-LAG_TAU = 0.14
+LAG_TAU = 0.20     # actuator lag (from launch param)
+DELAY_SEC = 0.20   # input delay
+DELAY_STEP = int(DELAY_SEC / DT)  # = 5
+PREVIEW_STEP = 50  # curvature lookahead points
 
 IZ = LF * LR * MASS
 CF = MASS * (LF / (LF + LR)) * 0.5 * 9.81 * 0.165 * 180 / np.pi
@@ -34,7 +43,41 @@ SIGMA2 = -2.0 * (LF * CF - LR * CR)
 SIGMA3 = -2.0 * (LF**2 * CF + LR**2 * CR)
 
 
-# ── Speed-scheduled Q/R weights ─────────────────────────────────────
+# ── PID Speed Controller (from pid.cpp) ─────────────────────────────
+class PIDController:
+    """PID controller for longitudinal speed tracking."""
+    def __init__(self, kp=1.5, ki=0.3, kd=0.05, dt=DT,
+                 output_min=-5.0, output_max=3.0, integral_max=10.0):
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+        self.dt = dt
+        self.output_min = output_min  # max decel m/s²
+        self.output_max = output_max  # max accel m/s²
+        self.integral_max = integral_max
+        self.reset()
+
+    def reset(self):
+        self.integral = 0.0
+        self.prev_error = 0.0
+
+    def compute(self, setpoint, measurement):
+        error = setpoint - measurement
+        # Proportional
+        p = self.kp * error
+        # Integral with anti-windup
+        self.integral += error * self.dt
+        self.integral = np.clip(self.integral, -self.integral_max, self.integral_max)
+        i = self.ki * self.integral
+        # Derivative (on error)
+        d = self.kd * (error - self.prev_error) / self.dt
+        self.prev_error = error
+        # Output clamp
+        output = np.clip(p + i + d, self.output_min, self.output_max)
+        return output
+
+
+# ── Speed-scheduled Q/R weights (from reschedule_weight) ────────────
 def get_weights(speed_kmh):
     if speed_kmh > 108:
         return 0.8, 1.0, 1.3, 0.8, 7800.0
@@ -54,9 +97,13 @@ def get_weights(speed_kmh):
         return 5.0, 5.0, 10.0, 1.0, 2000.0
 
 
-# ── Bicycle model + LQR ─────────────────────────────────────────────
-def build_state_matrices(vel):
+# ── Extended Vehicle Model (from vehicle_model_dynamics.cpp) ─────────
+def build_extended_matrices(vel):
+    """Build delay-augmented discrete system: (5+delay_step) x (5+delay_step)."""
     vel = max(vel, 1.5)
+    n = 5 + DELAY_STEP  # total state dimension
+
+    # 4x4 continuous lateral dynamics
     Abaroc = np.zeros((4, 4))
     Abaroc[0, 1] = 1.0
     Abaroc[1, 1] = -SIGMA1 / (MASS * vel)
@@ -71,6 +118,12 @@ def build_state_matrices(vel):
     Bbaroc[1, 0] = 2 * CF / MASS
     Bbaroc[3, 0] = 2 * LF * CF / IZ
 
+    # Disturbance matrix (curvature coupling)
+    Dbaroc = np.zeros((4, 1))
+    Dbaroc[1, 0] = SIGMA2 / MASS - vel * vel
+    Dbaroc[3, 0] = SIGMA3 / IZ
+
+    # 5x5 with actuator lag
     Abarc = np.zeros((5, 5))
     Abarc[:4, :4] = Abaroc
     Abarc[:4, 4:5] = Bbaroc
@@ -79,20 +132,71 @@ def build_state_matrices(vel):
     Bbarc = np.zeros((5, 1))
     Bbarc[4, 0] = 1.0 / LAG_TAU
 
+    Dbarc = np.zeros((5, 1))
+    Dbarc[:4, :] = Dbaroc
+
+    # Bilinear (Tustin) discretization
     I5 = np.eye(5)
     Ad_inv = np.linalg.inv(I5 - DT * 0.5 * Abarc)
     Ad = Ad_inv @ (I5 + DT * 0.5 * Abarc)
     Bd = Ad_inv @ (DT * Bbarc)
-    return Ad, Bd
+    Dd = Ad_inv @ (DT * Dbarc)
+
+    # Augment with delay buffer: state = [ey, ey_dot, epsi, epsi_dot, delta_act, δ₋₁, δ₋₂, ..., δ₋ₙ]
+    mcAd = np.zeros((n, n))
+    mcAd[:5, :5] = Ad
+    mcAd[:5, 5:6] = Bd      # first delayed command feeds into dynamics
+    # Shift register for delay buffer
+    if DELAY_STEP > 1:
+        mcAd[5:5+DELAY_STEP-1, 6:6+DELAY_STEP-1] = np.eye(DELAY_STEP - 1)
+
+    mcBd = np.zeros((n, 1))
+    mcBd[n - 1, 0] = 1.0    # new command enters at end of buffer
+
+    mcDd = np.zeros((n, 1))
+    mcDd[:5, :] = Dd
+
+    return mcAd, mcBd, mcDd
 
 
-def compute_lqr_gain(Ad, Bd, Q, R):
+def solve_dare_extended(mcAd, mcBd, Q, R):
+    """Solve DARE for extended system, return P matrix."""
     try:
-        P = solve_discrete_are(Ad, Bd, Q, R)
-        K = np.linalg.inv(R + Bd.T @ P @ Bd) @ Bd.T @ P @ Ad
-        return K
+        P = solve_discrete_are(mcAd, mcBd, Q, R)
+        return P
     except Exception:
-        return np.zeros((1, 5))
+        return None
+
+
+def compute_preview_control(mcAd, mcBd, mcDd, P, R, Xk, Cr):
+    """
+    Compute full control: state feedback + preview feedforward.
+    Matches vehicle_model_dynamics.cpp computeGain().
+    """
+    # State feedback gain: Kb = (R + Bd'PBd)^-1 Bd'P Ad
+    inv_term = np.linalg.inv(R + mcBd.T @ P @ mcBd) @ mcBd.T
+
+    # State feedback: u_state = -Kb * Xk
+    Kb = inv_term @ P @ mcAd
+    u_state = float((-Kb @ Xk).item())
+
+    # Preview feedforward
+    # Kf_0 = (R + Bd'PBd)^-1 Bd'P Dd
+    kf_col = inv_term @ P @ mcDd
+    u_preview = float((-kf_col * Cr[0]).item())
+
+    # Future preview gains via zeta power series
+    n = mcAd.shape[0]
+    In = np.eye(n)
+    zeta = mcAd.T @ np.linalg.inv(In + P @ mcBd @ np.linalg.inv(R) @ mcBd.T)
+    zeta_pow = In.copy()
+
+    for i in range(1, len(Cr)):
+        zeta_pow = zeta_pow @ zeta
+        kf_i = inv_term @ zeta_pow @ P @ mcDd
+        u_preview += float((-kf_i * Cr[i]).item())
+
+    return u_state + u_preview, u_state, u_preview
 
 
 # ── Oval track ───────────────────────────────────────────────────────
@@ -136,6 +240,16 @@ def compute_errors(track, idx, x, y, yaw):
     return ey, epsi
 
 
+def get_preview_curvatures(track, idx, n_preview):
+    """Extract future curvature values from track (wrapping around)."""
+    n_track = len(track)
+    curvatures = np.zeros(n_preview)
+    for i in range(n_preview):
+        ci = (idx + i) % n_track
+        curvatures[i] = track[ci, 3]
+    return curvatures
+
+
 # ── Simulation State ─────────────────────────────────────────────────
 class SimState:
     def __init__(self, track):
@@ -155,6 +269,12 @@ class SimState:
         self.paused = False
         self.speed_offset = 0  # km/h user offset
 
+        # Delay buffer: past steering commands
+        self.delta_buffer = [0.0] * DELAY_STEP
+
+        # PID speed controller
+        self.pid = PIDController(kp=1.5, ki=0.3, kd=0.05)
+
         # History buffers (rolling window)
         self.max_hist = 1500  # 60s at 20Hz
         self.hist_t = []
@@ -163,9 +283,12 @@ class SimState:
         self.hist_ey = []
         self.hist_epsi = []
         self.hist_speed = []
+        self.hist_target_speed = []
         self.hist_delta = []
         self.hist_Q_ey = []
         self.hist_R_w = []
+        self.hist_u_state = []
+        self.hist_u_preview = []
 
     def step_sim(self):
         if self.paused:
@@ -174,14 +297,12 @@ class SimState:
         idx = find_closest_index(self.track, self.x, self.y)
         curv = self.track[idx, 3]
 
-        # Speed profile
+        # ── PID Speed Control ──
         base_target = 60 if curv > 0.001 else 110
         target_speed_kmh = max(20, base_target + self.speed_offset)
         target_speed = target_speed_kmh / 3.6
-        if self.vx < target_speed:
-            self.vx = min(self.vx + 2.0 * DT, target_speed)
-        else:
-            self.vx = max(self.vx - 3.0 * DT, target_speed)
+        accel = self.pid.compute(target_speed, self.vx)
+        self.vx = max(1.0, self.vx + accel * DT)
 
         speed_kmh = self.vx * 3.6
         ey, epsi = compute_errors(self.track, idx, self.x, self.y, self.yaw)
@@ -193,26 +314,60 @@ class SimState:
             ey_dot = 0.0
             epsi_dot = 0.0
 
+        # ── Speed-scheduled weights ──
         q_ey, q_eydot, q_epsi, q_epsidot, r_w = get_weights(speed_kmh)
-        Q = np.diag([q_ey, q_eydot, q_epsi, q_epsidot, 0.0])
+        n = 5 + DELAY_STEP
+        Q = np.zeros((n, n))
+        Q[0, 0] = q_ey
+        Q[1, 1] = q_eydot
+        Q[2, 2] = q_epsi
+        Q[3, 3] = q_epsidot
         R = np.array([[r_w]])
 
-        Ad, Bd = build_state_matrices(self.vx)
-        K = compute_lqr_gain(Ad, Bd, Q, R)
+        # ── Build extended system & solve DARE ──
+        mcAd, mcBd, mcDd = build_extended_matrices(self.vx)
+        P = solve_dare_extended(mcAd, mcBd, Q, R)
 
-        state = np.array([[ey], [ey_dot], [epsi], [epsi_dot], [self.delta_actual]])
-        delta_cmd = float((-K @ state).item())
+        if P is not None:
+            # Extended state: [ey, ey_dot, epsi, epsi_dot, delta_actual, δ_buf...]
+            Xk = np.zeros((n, 1))
+            Xk[0, 0] = ey
+            Xk[1, 0] = ey_dot
+            Xk[2, 0] = epsi
+            Xk[3, 0] = epsi_dot
+            Xk[4, 0] = self.delta_actual
+            for i in range(DELAY_STEP):
+                Xk[5 + i, 0] = self.delta_buffer[i]
 
-        # Steering rate limit
-        rate_limit = 0.5
-        delta_rate = np.clip((delta_cmd - self.delta_actual) / DT, -rate_limit, rate_limit)
-        delta_cmd = self.delta_actual + delta_rate * DT
+            # Preview curvatures
+            Cr = get_preview_curvatures(self.track, idx, PREVIEW_STEP)
+
+            # Full control: state feedback + preview feedforward
+            delta_cmd, u_state, u_preview = compute_preview_control(
+                mcAd, mcBd, mcDd, P, R, Xk, Cr)
+        else:
+            delta_cmd = 0.0
+            u_state, u_preview = 0.0, 0.0
+
+        # ── Steering rate limit (0.5 rad/s) ──
+        diff_delta = delta_cmd - self.delta_buffer[-1] if self.delta_buffer else delta_cmd
+        rate_limit = 0.5  # rad/s
+        if abs(diff_delta) / DT > rate_limit:
+            if diff_delta > 0:
+                delta_cmd = (self.delta_buffer[-1] if self.delta_buffer else 0) + rate_limit * DT
+            else:
+                delta_cmd = (self.delta_buffer[-1] if self.delta_buffer else 0) - rate_limit * DT
+
         delta_cmd = np.clip(delta_cmd, -0.5, 0.5)
 
-        # Actuator lag
+        # Update delay buffer (shift + append new command)
+        self.delta_buffer.pop(0)
+        self.delta_buffer.append(delta_cmd)
+
+        # ── Actuator lag ──
         self.delta_actual += DT / LAG_TAU * (delta_cmd - self.delta_actual)
 
-        # Bicycle model update
+        # ── Bicycle model update ──
         beta = np.arctan(LR / WHEELBASE * np.tan(self.delta_actual))
         self.x += self.vx * np.cos(self.yaw + beta) * DT
         self.y += self.vx * np.sin(self.yaw + beta) * DT
@@ -227,22 +382,26 @@ class SimState:
         self.t += DT
         self.step += 1
 
-        # Append history
+        # ── Append history ──
         self.hist_t.append(self.t)
         self.hist_x.append(self.x)
         self.hist_y.append(self.y)
         self.hist_ey.append(ey)
         self.hist_epsi.append(np.degrees(epsi))
         self.hist_speed.append(speed_kmh)
+        self.hist_target_speed.append(target_speed_kmh)
         self.hist_delta.append(np.degrees(self.delta_actual))
         self.hist_Q_ey.append(q_ey)
         self.hist_R_w.append(r_w)
+        self.hist_u_state.append(np.degrees(u_state))
+        self.hist_u_preview.append(np.degrees(u_preview))
 
         # Trim history
         if len(self.hist_t) > self.max_hist:
             for h in [self.hist_t, self.hist_x, self.hist_y, self.hist_ey,
-                       self.hist_epsi, self.hist_speed, self.hist_delta,
-                       self.hist_Q_ey, self.hist_R_w]:
+                       self.hist_epsi, self.hist_speed, self.hist_target_speed,
+                       self.hist_delta, self.hist_Q_ey, self.hist_R_w,
+                       self.hist_u_state, self.hist_u_preview]:
                 del h[0]
 
 
@@ -261,67 +420,82 @@ def main():
     ref_color = '#4a90d9'
 
     fig = plt.figure(figsize=(16, 9), facecolor=dark_bg)
-    fig.canvas.manager.set_window_title('LQR Controller - USAFE Racing (Interactive)')
+    fig.canvas.manager.set_window_title('LQR Preview Controller - USAFE Racing (Full)')
 
-    gs = fig.add_gridspec(3, 4, hspace=0.4, wspace=0.3,
+    gs = fig.add_gridspec(4, 4, hspace=0.5, wspace=0.3,
                           left=0.05, right=0.98, top=0.91, bottom=0.06)
     ax_track = fig.add_subplot(gs[:, :2])
     ax_ey    = fig.add_subplot(gs[0, 2:])
     ax_epsi  = fig.add_subplot(gs[1, 2:])
     ax_speed = fig.add_subplot(gs[2, 2:])
+    ax_ctrl  = fig.add_subplot(gs[3, 2:])
 
-    for ax in [ax_track, ax_ey, ax_epsi, ax_speed]:
+    for ax in [ax_track, ax_ey, ax_epsi, ax_speed, ax_ctrl]:
         ax.set_facecolor(panel_bg)
-        ax.tick_params(colors=text_color, labelsize=8)
+        ax.tick_params(colors=text_color, labelsize=7)
         for spine in ax.spines.values():
             spine.set_color(grid_color)
 
-    fig.suptitle('LQR Preview Controller — USAFE Racing (Real-time)',
-                 fontsize=14, color=text_color, fontweight='bold', y=0.97)
+    fig.suptitle('LQR Preview Controller — USAFE Racing (Full: PID + Delay + Preview)',
+                 fontsize=13, color=text_color, fontweight='bold', y=0.97)
 
     # Track background
     ax_track.plot(track[:, 0], track[:, 1], '-', color=track_color, lw=18, alpha=0.5, solid_capstyle='round')
     ax_track.plot(track[:, 0], track[:, 1], '--', color=ref_color, lw=1.2, alpha=0.7)
     ax_track.set_aspect('equal')
-    ax_track.set_title('Track View', color=text_color, fontsize=11, pad=6)
+    ax_track.set_title('Track View', color=text_color, fontsize=10, pad=5)
     ax_track.grid(True, color=grid_color, alpha=0.3, linewidth=0.5)
 
     trail_line, = ax_track.plot([], [], '-', color=accent, lw=2, alpha=0.8)
     car_dot, = ax_track.plot([], [], 'o', color='#ff6b6b', markersize=8, zorder=5)
     speed_text = ax_track.text(0.02, 0.96, '', transform=ax_track.transAxes,
-                               color='#00ff88', fontsize=11, fontweight='bold',
+                               color='#00ff88', fontsize=10, fontweight='bold',
                                va='top', fontfamily='monospace')
-    weight_text = ax_track.text(0.02, 0.88, '', transform=ax_track.transAxes,
-                                color='#ffcc00', fontsize=9, va='top', fontfamily='monospace')
+    weight_text = ax_track.text(0.02, 0.87, '', transform=ax_track.transAxes,
+                                color='#ffcc00', fontsize=8, va='top', fontfamily='monospace')
+    ctrl_text = ax_track.text(0.02, 0.79, '', transform=ax_track.transAxes,
+                              color='#ff9944', fontsize=8, va='top', fontfamily='monospace')
     time_text = ax_track.text(0.98, 0.96, '', transform=ax_track.transAxes,
-                              color=text_color, fontsize=10, fontweight='bold',
+                              color=text_color, fontsize=9, fontweight='bold',
                               va='top', ha='right', fontfamily='monospace')
     status_text = ax_track.text(0.5, 0.02, '', transform=ax_track.transAxes,
-                                color='#ff6b6b', fontsize=10, fontweight='bold',
+                                color='#ff6b6b', fontsize=9, fontweight='bold',
                                 va='bottom', ha='center', fontfamily='monospace')
 
     # Right-side plots
-    ax_ey.set_title('Lateral Error (m)', color=text_color, fontsize=10, pad=4)
+    ax_ey.set_title('Lateral Error (m)', color=text_color, fontsize=9, pad=3)
     ax_ey.set_ylim(-3, 3)
     ax_ey.axhline(0, color=ref_color, lw=0.8, alpha=0.5)
     ax_ey.grid(True, color=grid_color, alpha=0.3, linewidth=0.5)
     ey_line, = ax_ey.plot([], [], '-', color='#00ff88', lw=1.5)
 
-    ax_epsi.set_title('Heading Error (deg)', color=text_color, fontsize=10, pad=4)
+    ax_epsi.set_title('Heading Error (deg)', color=text_color, fontsize=9, pad=3)
     ax_epsi.set_ylim(-10, 10)
     ax_epsi.axhline(0, color=ref_color, lw=0.8, alpha=0.5)
     ax_epsi.grid(True, color=grid_color, alpha=0.3, linewidth=0.5)
     epsi_line, = ax_epsi.plot([], [], '-', color='#ff6b6b', lw=1.5)
 
-    ax_speed.set_title('Speed (km/h)', color=text_color, fontsize=10, pad=4)
+    ax_speed.set_title('Speed (km/h)', color=text_color, fontsize=9, pad=3)
     ax_speed.set_ylim(0, 140)
     ax_speed.grid(True, color=grid_color, alpha=0.3, linewidth=0.5)
-    ax_speed.set_xlabel('Time (s)', color=text_color, fontsize=9)
-    speed_line, = ax_speed.plot([], [], '-', color='#ffcc00', lw=1.5)
+    speed_line, = ax_speed.plot([], [], '-', color='#ffcc00', lw=1.5, label='Actual')
+    target_speed_line, = ax_speed.plot([], [], '--', color='#ff6b6b', lw=1, alpha=0.6, label='Target')
+    ax_speed.legend(loc='upper right', fontsize=7, facecolor=panel_bg,
+                    edgecolor=grid_color, labelcolor=text_color)
+
+    ax_ctrl.set_title('Control Decomposition (deg)', color=text_color, fontsize=9, pad=3)
+    ax_ctrl.set_ylim(-5, 5)
+    ax_ctrl.axhline(0, color=ref_color, lw=0.8, alpha=0.5)
+    ax_ctrl.grid(True, color=grid_color, alpha=0.3, linewidth=0.5)
+    ax_ctrl.set_xlabel('Time (s)', color=text_color, fontsize=8)
+    state_fb_line, = ax_ctrl.plot([], [], '-', color='#00bbff', lw=1.2, label='State FB')
+    preview_fb_line, = ax_ctrl.plot([], [], '-', color='#ff66aa', lw=1.2, label='Preview FF')
+    ax_ctrl.legend(loc='upper right', fontsize=7, facecolor=panel_bg,
+                   edgecolor=grid_color, labelcolor=text_color)
 
     # Help text
     help_str = '[Space] Pause  [Up/Dn] Speed  [R] Reset  [Q] Quit'
-    fig.text(0.5, 0.01, help_str, ha='center', color='#666', fontsize=8, fontfamily='monospace')
+    fig.text(0.5, 0.005, help_str, ha='center', color='#666', fontsize=7, fontfamily='monospace')
 
     # Keyboard handler
     def on_key(event):
@@ -338,11 +512,9 @@ def main():
 
     fig.canvas.mpl_connect('key_press_event', on_key)
 
-    # Time window for rolling plots (seconds)
     plot_window = 30.0
 
     def animate(_frame):
-        # Run multiple sim steps per frame to match real-time at ~30fps display
         steps_per_frame = max(1, int(1.0 / (30 * DT)))
         for _ in range(steps_per_frame):
             sim.step_sim()
@@ -350,11 +522,9 @@ def main():
         if len(sim.hist_t) < 2:
             return []
 
-        # Trail on track (last 300 points)
+        # Trail on track
         trail_n = 300
-        trail_x = sim.hist_x[-trail_n:]
-        trail_y = sim.hist_y[-trail_n:]
-        trail_line.set_data(trail_x, trail_y)
+        trail_line.set_data(sim.hist_x[-trail_n:], sim.hist_y[-trail_n:])
         car_dot.set_data([sim.hist_x[-1]], [sim.hist_y[-1]])
 
         # Auto-zoom
@@ -366,6 +536,7 @@ def main():
         # Info
         speed_text.set_text(f"Speed: {sim.hist_speed[-1]:.0f} km/h")
         weight_text.set_text(f"Q_ey={sim.hist_Q_ey[-1]:.1f}  R={sim.hist_R_w[-1]:.0f}")
+        ctrl_text.set_text(f"StateFB={sim.hist_u_state[-1]:.2f}  Preview={sim.hist_u_preview[-1]:.2f}")
         time_text.set_text(f"t = {sim.t:.1f}s")
         if sim.paused:
             status_text.set_text('PAUSED')
@@ -374,14 +545,13 @@ def main():
         else:
             status_text.set_text('')
 
-        # Rolling time window for right-side plots
+        # Rolling time window
         t_arr = sim.hist_t
         t_min = max(0, t_arr[-1] - plot_window)
         t_max = t_arr[-1] + 1.0
 
         ax_ey.set_xlim(t_min, t_max)
         ey_line.set_data(t_arr, sim.hist_ey)
-        # Auto-scale Y
         window_ey = [e for t, e in zip(t_arr, sim.hist_ey) if t >= t_min]
         if window_ey:
             max_ey = max(abs(min(window_ey)), abs(max(window_ey)), 0.3) * 1.3
@@ -396,18 +566,33 @@ def main():
 
         ax_speed.set_xlim(t_min, t_max)
         speed_line.set_data(t_arr, sim.hist_speed)
+        target_speed_line.set_data(t_arr, sim.hist_target_speed)
         window_spd = [s for t, s in zip(t_arr, sim.hist_speed) if t >= t_min]
         if window_spd:
             ax_speed.set_ylim(max(0, min(window_spd) - 10), max(window_spd) + 10)
 
-        return [trail_line, car_dot, ey_line, epsi_line, speed_line]
+        ax_ctrl.set_xlim(t_min, t_max)
+        state_fb_line.set_data(t_arr, sim.hist_u_state)
+        preview_fb_line.set_data(t_arr, sim.hist_u_preview)
+        window_us = [s for t, s in zip(t_arr, sim.hist_u_state) if t >= t_min]
+        window_up = [s for t, s in zip(t_arr, sim.hist_u_preview) if t >= t_min]
+        if window_us and window_up:
+            all_ctrl = window_us + window_up
+            max_c = max(abs(min(all_ctrl)), abs(max(all_ctrl)), 1.0) * 1.3
+            ax_ctrl.set_ylim(-max_c, max_c)
+
+        return [trail_line, car_dot, ey_line, epsi_line, speed_line,
+                target_speed_line, state_fb_line, preview_fb_line]
 
     anim = animation.FuncAnimation(fig, animate, interval=33, blit=False, cache_frame_data=False)
     plt.show()
 
 
 if __name__ == '__main__':
-    print("LQR Preview Controller - Real-time Simulation")
+    print("LQR Preview Controller - Full Implementation")
+    print("  PID speed control + Delay compensation + Preview feedforward")
+    print("  Delay steps:", DELAY_STEP, f"({DELAY_SEC}s)")
+    print("  Preview steps:", PREVIEW_STEP)
     print("Controls: [Space] Pause  [Up/Down] Speed  [R] Reset  [Q] Quit")
     print("Starting...")
     main()
