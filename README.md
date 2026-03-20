@@ -4,26 +4,20 @@ Speed-scheduled LQR preview controller for autonomous racing, based on a bicycle
 
 Ported from the C++ ROS controller used by HMCL-UNIST (USAFE Racing Team) at KIAPI 2024.
 
-![demo](demo.gif)
+## 1. LQR Lateral Controller
 
-## Features
+![LQR Demo](demo.gif)
 
-- **PID speed controller** with gain scheduling for longitudinal velocity tracking
 - **LQR preview controller** with delay compensation for lateral steering
 - **Delay-augmented state** (5 + delay_step = 10 dimensions)
 - **Curvature preview feedforward** (50-step lookahead)
-- Discrete-time LQR with Bilinear (Tustin) discretization
+- **PID speed controller** with gain scheduling for longitudinal velocity tracking
 - Speed-scheduled Q/R weights (20~110+ km/h)
-- Real-time matplotlib visualization with control decomposition
-
-## Run
 
 ```bash
 pip install numpy matplotlib scipy
 python3 lqr_controller.py
 ```
-
-## Controls
 
 | Key | Action |
 |-----|--------|
@@ -31,6 +25,41 @@ python3 lqr_controller.py
 | Up/Down | Adjust target speed +/-10 km/h |
 | R | Reset simulation |
 | Q / Esc | Quit |
+
+## 2. Two-Vehicle Adaptive Cruise Control (ACC)
+
+![ACC Demo](two_vehicle_acc_demo.gif)
+
+LQR-based Adaptive Cruise Control with two vehicles on an oval racing track.
+
+- **Lead vehicle** (orange): Variable speed - slows in curves, periodic speed changes, braking events
+- **Ego vehicle** (red): LQR lateral control + LQR-based ACC longitudinal control
+- **ACC Modes**: CRUISE (green) / FOLLOW (yellow) / BRAKE (red)
+- Emergency braking with hard speed limiting for collision avoidance
+- Time-gap based following distance (1.0s gap + 8.0m minimum)
+
+```bash
+python3 two_vehicle_acc_demo.py
+```
+
+| Key | Action |
+|-----|--------|
+| Space | Pause / Resume |
+| Up/Down | Adjust ego cruise speed +/-10 km/h |
+| L/K | Adjust lead vehicle speed +/-5 km/h |
+| R | Reset simulation |
+| Q / Esc | Quit |
+
+### ACC Control Law
+
+The ACC uses an LQR controller with state vector $\mathbf{x} = [e_d, e_v, a]^T$ (distance error, velocity error, current acceleration). The desired following distance is:
+
+$$d_{\text{desired}} = v_{\text{ego}} \cdot t_{\text{gap}} + d_{\text{min}}$$
+
+Three-layer safety architecture:
+1. **LQR ACC** (normal): Optimal control maintaining time-gap
+2. **Proportional brake** (close): Bypass LQR lag when $d < 0.8 \cdot d_{\text{desired}}$
+3. **Emergency brake** (critical): Full deceleration + speed capping when $d < 1.5 \cdot d_{\text{min}}$
 
 ---
 
