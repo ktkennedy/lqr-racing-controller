@@ -52,14 +52,101 @@ python3 two_vehicle_acc_demo.py
 
 ### ACC Control Law
 
-The ACC uses an LQR controller with state vector $\mathbf{x} = [e_d, e_v, a]^T$ (distance error, velocity error, current acceleration). The desired following distance is:
+LQR-based optimal speed controller that maintains a safe following distance to the lead vehicle.
+
+### ACC Vehicle Model
+
+3-state longitudinal model with actuator lag:
+
+**State vector:**
+
+$$\mathbf{x} = \begin{bmatrix} e_d \\ e_v \\ a \end{bmatrix}$$
+
+| State | Description |
+|---|---|
+| $e_d$ | Distance error: $d_{\text{desired}} - d_{\text{actual}}$ |
+| $e_v$ | Velocity error (relative speed) |
+| $a$ | Current longitudinal acceleration |
+
+**Desired following distance:**
 
 $$d_{\text{desired}} = v_{\text{ego}} \cdot t_{\text{gap}} + d_{\text{min}}$$
 
-Three-layer safety architecture:
-1. **LQR ACC** (normal): Optimal control maintaining time-gap
-2. **Proportional brake** (close): Bypass LQR lag when $d < 0.8 \cdot d_{\text{desired}}$
-3. **Emergency brake** (critical): Full deceleration + speed capping when $d < 1.5 \cdot d_{\text{min}}$
+where $t_{\text{gap}} = 1.0$ s (time headway) and $d_{\text{min}} = 8.0$ m (minimum gap).
+
+### ACC Continuous System Matrices
+
+**Dynamics matrix** $A_c$:
+
+$$A_c = \begin{bmatrix} 0 & 0 & t_{\text{gap}} \\ 0 & -1 & 1 \\ 0 & 0 & -1/\tau \end{bmatrix}$$
+
+**Input matrix** $B_c$:
+
+$$B_c = \begin{bmatrix} 0 \\ 0 \\ 1/\tau \end{bmatrix}$$
+
+where $\tau = 0.6$ s is the longitudinal actuator time constant.
+
+**Physical interpretation:**
+
+| Row | Equation | Meaning |
+|---|---|---|
+| $\dot{e}_d$ | $= t_{\text{gap}} \cdot a$ | Distance error changes with time-gap × acceleration |
+| $\dot{e}_v$ | $= -e_v + a$ | Velocity error with damping + acceleration coupling |
+| $\dot{a}$ | $= -a/\tau + u/\tau$ | First-order actuator lag on acceleration |
+
+### ACC Discretization (Bilinear / Tustin)
+
+Same method as the lateral controller:
+
+$$A_d = \left(I - \frac{\Delta t}{2} A_c\right)^{-1} \left(I + \frac{\Delta t}{2} A_c\right)$$
+
+$$B_d = \left(I - \frac{\Delta t}{2} A_c\right)^{-1} \Delta t \cdot B_c$$
+
+where $\Delta t = 0.04$ s (25 Hz).
+
+### ACC DARE and Control Law
+
+**Cost function:**
+
+$$J = \sum_{k=0}^{\infty} \left( \mathbf{x}_k^T Q \mathbf{x}_k + u_k^T R \, u_k \right)$$
+
+**Weight matrices:**
+
+$$Q = \begin{bmatrix} Q_d & 0 & 0 \\ 0 & Q_v & 0 \\ 0 & 0 & 0 \end{bmatrix}, \quad R = [R_w]$$
+
+| Parameter | Symbol | Value |
+|---|---|---|
+| Distance error weight | $Q_d$ | 50.0 |
+| Velocity error weight | $Q_v$ | 20.0 |
+| Control effort weight | $R_w$ | 1.0 |
+
+**DARE iteration** (same as lateral):
+
+$$P_{k+1} = A_d^T P_k A_d - A_d^T P_k B_d \left(R + B_d^T P_k B_d\right)^{-1} B_d^T P_k A_d + Q$$
+
+**Optimal gain:**
+
+$$K = \left(R + B_d^T P B_d\right)^{-1} B_d^T P A_d$$
+
+**Control law:**
+
+$$u = -K \cdot \mathbf{x}_k \quad \text{(acceleration command, m/s²)}$$
+
+**Velocity integration:**
+
+$$v_{\text{cmd}} = v_{\text{current}} + u \cdot \Delta t$$
+
+### ACC Safety Architecture
+
+Three-layer override on top of LQR:
+
+| Layer | Condition | Action |
+|---|---|---|
+| **LQR ACC** | $d > 0.8 \cdot d_{\text{desired}}$ | Optimal LQR control with lag model |
+| **Proportional brake** | $d < 0.8 \cdot d_{\text{desired}}$ | Bypass LQR lag, direct proportional deceleration |
+| **Emergency brake** | $d < 1.5 \cdot d_{\text{min}}$ | Full deceleration ($-7.0$ m/s²) + hard speed cap to $0.9 \cdot v_{\text{lead}}$ |
+
+The safety layers exist because the LQR's actuator lag model ($\tau = 0.6$ s) causes slow response to sudden braking events. The proportional and emergency layers bypass this lag for collision avoidance.
 
 ---
 
